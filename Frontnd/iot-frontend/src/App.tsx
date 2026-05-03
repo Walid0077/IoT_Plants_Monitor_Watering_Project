@@ -223,6 +223,22 @@ function normalizePredictions(payload: unknown): Predictions {
   return normalized;
 }
 
+type PlantParams = {
+  sampleFrequency: number;
+  fieldCapacity: number;
+  wiltingPoint: number;
+  targetSoilMoisture: number;
+  soilVolumeLiters: number;
+};
+
+const DEFAULT_PLANT_PARAMS: PlantParams = {
+  sampleFrequency: 10,
+  fieldCapacity: 80,
+  wiltingPoint: 30,
+  targetSoilMoisture: 55,
+  soilVolumeLiters: 5,
+};
+
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`);
 
@@ -516,10 +532,58 @@ function App() {
     const [feedMode, setFeedMode] = useState<FeedMode>("live");
     const [dataNotice, setDataNotice] = useState("");
     const [predictionNotice, setPredictionNotice] = useState("");
+    const [paramsNotice, setParamsNotice] = useState("");
+    const [paramsError, setParamsError] = useState("");
+    const [isUpdatingParams, setIsUpdatingParams] = useState(false);
+    const [params, setParams] = useState<PlantParams>(() => DEFAULT_PLANT_PARAMS);
 
     const latestReading = readings.at(-1) ?? null;
     const rows = useMemo(() => readings.slice(-8).reverse(), [readings]);
-    const notices = [dataNotice, predictionNotice].filter(Boolean);
+    const notices = [dataNotice, predictionNotice, paramsNotice].filter(Boolean);
+
+    const handleParamChange = (
+      key: keyof PlantParams,
+      value: string,
+    ) => {
+      setParams((current) => ({
+        ...current,
+        [key]: Number(value),
+      }));
+    };
+
+    const updateParams = async () => {
+      setParamsError("");
+      setParamsNotice("");
+      setIsUpdatingParams(true);
+
+      try {
+        const response = await fetch(`${API_BASE_URL}/api/update-params`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(params),
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(
+            `Update failed (${response.status}): ${text || response.statusText}`,
+          );
+        }
+
+        setParamsNotice("Parameters updated successfully.");
+      } catch (error) {
+        console.error(error);
+        setParamsError(
+          error instanceof Error
+            ? error.message
+            : "Unable to update parameters.",
+        );
+      } finally {
+        setIsUpdatingParams(false);
+      }
+    };
 
     useEffect(() => {
       let cancelled = false;
@@ -651,6 +715,96 @@ function App() {
           {notice}
         </p>
       ))}
+      {paramsError && (
+        <p className="notice notice-error">{paramsError}</p>
+      )}
+
+      <section className="settings-section">
+        <div className="section-heading">
+          <div>
+            <p className="eyebrow">Plant settings</p>
+            <h2>Update sampling and pot parameters</h2>
+          </div>
+          <button
+            className="primary-button"
+            type="button"
+            onClick={updateParams}
+            disabled={isUpdatingParams}
+          >
+            {isUpdatingParams ? "Updating..." : "Update"}
+          </button>
+        </div>
+
+        <div className="settings-grid">
+          <label>
+            Sample frequency
+            <input
+              type="number"
+              min={1}
+              step={1}
+              value={params.sampleFrequency}
+              onChange={(event) =>
+                handleParamChange("sampleFrequency", event.target.value)
+              }
+            />
+          </label>
+
+          <label>
+            Field capacity (%)
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              value={params.fieldCapacity}
+              onChange={(event) =>
+                handleParamChange("fieldCapacity", event.target.value)
+              }
+            />
+          </label>
+
+          <label>
+            Wilting point (%)
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              value={params.wiltingPoint}
+              onChange={(event) =>
+                handleParamChange("wiltingPoint", event.target.value)
+              }
+            />
+          </label>
+
+          <label>
+            Target soil moisture (%)
+            <input
+              type="number"
+              min={0}
+              max={100}
+              step={0.1}
+              value={params.targetSoilMoisture}
+              onChange={(event) =>
+                handleParamChange("targetSoilMoisture", event.target.value)
+              }
+            />
+          </label>
+
+          <label>
+            Soil volume (L)
+            <input
+              type="number"
+              min={0}
+              step={0.1}
+              value={params.soilVolumeLiters}
+              onChange={(event) =>
+                handleParamChange("soilVolumeLiters", event.target.value)
+              }
+            />
+          </label>
+        </div>
+      </section>
 
       <section className="chart-grid" aria-label="Plant sensor charts">
         {metrics.map((metric) => (

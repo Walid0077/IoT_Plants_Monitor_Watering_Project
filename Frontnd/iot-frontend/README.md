@@ -1,3 +1,8 @@
+to run: 
+cd c:\Users\39346\projects\IoT\PlantsWateringMonitorSystem\Frontnd\iot-frontend
+npm run dev
+
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.

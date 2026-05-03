@@ -52,11 +52,21 @@ volatile uint8_t rx_index = 0;
 
 volatile bool actuator_state = false;
 
+bool wait_for_pin_state(uint pin, bool state, uint32_t timeout_us) {
+    while (gpio_get(pin) != state) {
+        if (timeout_us-- == 0) {
+            return false;
+        }
+        sleep_us(1);
+    }
 
+    return true;
+}
 
 bool read_dht11(float *temperature, float *air_humidity) {
     uint8_t data[5] = {0, 0, 0, 0, 0};
 
+    // Start signal from Picok
     gpio_set_dir(DHT_PIN, GPIO_OUT);
     gpio_put(DHT_PIN, 0);
     sleep_ms(18);
@@ -66,43 +76,28 @@ bool read_dht11(float *temperature, float *air_humidity) {
 
     gpio_set_dir(DHT_PIN, GPIO_IN);
 
-    uint timeout = 10000;
+    // DHT11 response:
+    // LOW about 80 us, then HIGH about 80 us
+    if (!wait_for_pin_state(DHT_PIN, 0, 10000)) return false;
+    if (!wait_for_pin_state(DHT_PIN, 1, 10000)) return false;
+    if (!wait_for_pin_state(DHT_PIN, 0, 10000)) return false;
 
-    while (gpio_get(DHT_PIN) == 1) {
-        if (--timeout == 0) return false;
-        sleep_us(1);
-    }
-
-    timeout = 10000;
-    while (gpio_get(DHT_PIN) == 0) {
-        if (--timeout == 0) return false;
-        sleep_us(1);
-    }
-
-    timeout = 10000;
-    while (gpio_get(DHT_PIN) == 1) {
-        if (--timeout == 0) return false;
-        sleep_us(1);
-    }
-
+    // Read 40 bits
     for (int i = 0; i < 40; i++) {
-        timeout = 10000;
-        while (gpio_get(DHT_PIN) == 0) {
-            if (--timeout == 0) return false;
-            sleep_us(1);
-        }
+        // Each bit starts with LOW for about 50 us
+        if (!wait_for_pin_state(DHT_PIN, 1, 10000)) return false;
 
+        // Then HIGH duration determines bit value:
+        // around 26-28 us = 0
+        // around 70 us    = 1
         uint32_t start = time_us_32();
 
-        timeout = 10000;
-        while (gpio_get(DHT_PIN) == 1) {
-            if (--timeout == 0) return false;
-            sleep_us(1);
-        }
+        if (!wait_for_pin_state(DHT_PIN, 0, 10000)) return false;
 
         uint32_t pulse_length = time_us_32() - start;
 
         data[i / 8] <<= 1;
+
         if (pulse_length > 50) {
             data[i / 8] |= 1;
         }
@@ -119,6 +114,8 @@ bool read_dht11(float *temperature, float *air_humidity) {
 
     return true;
 }
+
+// bool read_dht11(float *temperature, float *air_humidity) { uint8_t data[5] = {0, 0, 0, 0, 0}; gpio_set_dir(DHT_PIN, GPIO_OUT); gpio_put(DHT_PIN, 0); sleep_ms(18); gpio_put(DHT_PIN, 1); sleep_us(40); gpio_set_dir(DHT_PIN, GPIO_IN); uint timeout = 10000; while (gpio_get(DHT_PIN) == 1) { if (--timeout == 0) return false; sleep_us(1); } timeout = 10000; while (gpio_get(DHT_PIN) == 0) { if (--timeout == 0) return false; sleep_us(1); } timeout = 10000; while (gpio_get(DHT_PIN) == 1) { if (--timeout == 0) return false; sleep_us(1); } for (int i = 0; i < 40; i++) { timeout = 10000; while (gpio_get(DHT_PIN) == 0) { if (--timeout == 0) return false; sleep_us(1); } uint32_t start = time_us_32(); timeout = 10000; while (gpio_get(DHT_PIN) == 1) { if (--timeout == 0) return false; sleep_us(1); } uint32_t pulse_length = time_us_32() - start; data[i / 8] <<= 1; if (pulse_length > 50) { data[i / 8] |= 1; } } uint8_t checksum = data[0] + data[1] + data[2] + data[3]; if (checksum != data[4]) { return false; } *air_humidity = data[0] + data[1] * 0.1f; *temperature = data[2] + data[3] * 0.1f; return true; }
 
 bool bh1750_write_cmd(uint8_t cmd) {
     int result = i2c_write_blocking(SENSOR_I2C_PORT,BH1750_ADDR,&cmd,1,false);
@@ -318,12 +315,15 @@ int main() {
 
         update_i2c_packet(&packet);
 
-        printf("Updated packet:\n");
         printf("Light: %.2f\n", lux);
         printf("Temperature: %.2f C\n", temperature);
         printf("Air_humidity: %.2f %%\n", air_humidity);
         printf("Moisture raw: %u | Voltage: %.3f V\n", raw, moisture);
-        printf("Packet int32: %ld, %ld, %ld, %ld\n",packet.a,packet.b,packet.c,packet.d);
-        sleep_ms(10 + delay);
+        printf("Actuator state: %d\n", actuator_state);
+        printf("T: %d sec\n", (800 + delay)/1000);
+
+        
+        // printf("Packet int32: %ld, %ld, %ld, %ld\n",packet.a,packet.b,packet.c,packet.d);
+        sleep_ms((800 + delay));
     }
 }

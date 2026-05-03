@@ -4,8 +4,9 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 from pymongo import MongoClient, DESCENDING
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 
 
@@ -30,6 +31,17 @@ sensor_collection = db[MONGO_COLLECTION_NAME]
 MQTT_BROKER = "localhost"
 MQTT_PORT = 1883
 MQTT_TOPIC = "iot/gateway-001/telemetry"
+MQTT_TOPIC2 = "iot/gateway-001/updateparams"
+
+mqtt_client = mqtt.Client(client_id="iot-server")
+params_lock = threading.Lock()
+PLANT_PARAMS = {
+    "fieldCapacity": 80.0,
+    "sampleFrequency": 10,
+    "soilVolumeLiters": 5.0,
+    "targetSoilMoisture": 55.0,
+    "wiltingPoint": 30.0,
+}
 
 
 # -----------------------------
@@ -60,7 +72,6 @@ def newest_documents(limit):
         sensor_collection
         .find()
         .sort([
-            ("received_at", DESCENDING),
             ("timestamp", DESCENDING),
             ("_id", DESCENDING),
         ])
@@ -99,6 +110,9 @@ def read_numeric_field(document, field_names):
 
 
 def predict_next_values(values, steps):
+    print(f" stps {steps}")
+    print(f" valus {values}")
+    
     if steps <= 0 or not values:
         return []
 
@@ -142,11 +156,11 @@ def store_sensor_data(data):
         "moisture": decoded["moisture"],
     }
 
-    print(document)
+    # print(document)
 
     result = sensor_collection.insert_one(document)
 
-    print(f"Data stored in MongoDB with id: {result.inserted_id}")
+    # print(f"Data stored in MongoDB with id: {result.inserted_id}")
 
 
 def serialize_document(document):
@@ -170,19 +184,61 @@ def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("Connected to MQTT broker")
         client.subscribe(MQTT_TOPIC)
-        print(f"Subscribed to topic: {MQTT_TOPIC}")
+        client.subscribe(MQTT_TOPIC2)
+        print(f"Subscribed to topics: {MQTT_TOPIC}, {MQTT_TOPIC2}")
     else:
         print(f"Failed to connect to MQTT broker. Return code: {rc}")
 
 
+def parse_update_params_payload(payload: str):
+    pairs = [part.strip() for part in payload.split(",") if part.strip()]
+    parsed = {}
+
+    for pair in pairs:
+        if ":" not in pair:
+            continue
+
+        key, value = [item.strip() for item in pair.split(":", 1)]
+        if key not in PLANT_PARAMS:
+            continue
+
+        try:
+            parsed[key] = float(value)
+        except ValueError:
+            return None
+
+    if not parsed:
+        return None
+
+    if "sampleFrequency" in parsed:
+        parsed["sampleFrequency"] = int(parsed["sampleFrequency"])
+
+    return parsed
+
+
+def update_local_params(params):
+    with params_lock:
+        for key, value in params.items():
+            if key in PLANT_PARAMS:
+                PLANT_PARAMS[key] = value
+
+        return json.dumps(PLANT_PARAMS, indent=2)
+
+
 def on_message(client, userdata, message):
     try:
-        payload = message.payload.decode()
+        payload = message.payload.decode().strip()
+
+        if message.topic == MQTT_TOPIC2:
+            parsed = parse_update_params_payload(payload)
+            if parsed is None:
+                print(f"Unable to parse update params payload: {payload}")
+                return
+
+            update_local_params(parsed)
+            return
+
         data = json.loads(payload)
-
-        print("\nReceived MQTT packet:")
-        print(json.dumps(data, indent=4))
-
         store_sensor_data(data)
 
     except KeyError as e:
@@ -196,14 +252,13 @@ def on_message(client, userdata, message):
 
 
 def start_mqtt_client():
-    client = mqtt.Client(client_id="iot-server")
-    client.on_connect = on_connect
-    client.on_message = on_message
+    mqtt_client.on_connect = on_connect
+    mqtt_client.on_message = on_message
 
     print(f"Connecting to MQTT broker at {MQTT_BROKER}:{MQTT_PORT}")
-    client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+    mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
 
-    client.loop_forever()
+    mqtt_client.loop_forever()
 
 
 
@@ -224,7 +279,7 @@ def get_latest_sensor_data():
     if document is None:
         return {"message": "No data available"}
     
-    print(serialize_document(document))
+    # print(serialize_document(document))
     return serialize_document(document)
 
 
@@ -234,24 +289,56 @@ def get_predictions(steps: int = 10, limit: int = 28):
     limit = max(2, min(limit, 500))
     documents = list(newest_documents(limit))
     documents.reverse()
+    # print(documents)
 
     response = {
         "steps": steps,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
-    for metric_name, field_names in METRIC_FIELD_NAMES.items():
-        values = [
-            value
-            for value in (
-                read_numeric_field(document, field_names)
-                for document in documents
-            )
-            if value is not None
-        ]
-        response[metric_name] = predict_next_values(values, steps)
+        
+    result = {}
 
-    return response
+    for doc in documents:
+        for key, value in METRIC_FIELD_NAMES.items():
+            if isinstance(doc[value], (int, float)) and not isinstance(value, bool):
+                if key not in result:
+                    result[key] = []
+
+                result[key].append(doc[value])
+            # response[value] = predict_next_values(result[value], steps)
+    print(result)
+
+
+class UpdateParams(BaseModel):
+    fieldCapacity: float
+    sampleFrequency: int
+    soilVolumeLiters: float
+    targetSoilMoisture: float
+    wiltingPoint: float
+
+
+@app.post("/api/update-params")
+def update_params(params: UpdateParams):
+    payload = (
+        f"fieldCapacity : {params.fieldCapacity}, "
+        f"sampleFrequency : {params.sampleFrequency}, "
+        f"soilVolumeLiters : {params.soilVolumeLiters} , "
+        f"targetSoilMoisture : {params.targetSoilMoisture}, "
+        f"wiltingPoint : {params.wiltingPoint}"
+    )
+
+    dic_payload =  update_local_params(params.model_dump())
+
+    result = mqtt_client.publish(MQTT_TOPIC2, dic_payload)
+
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise HTTPException(
+            status_code=500,
+            detail=f"MQTT publish failed with code {result.rc}",
+        )
+
+    return {"status": "ok", "published_payload": payload}
 
 
 @app.delete("/api/sensor-data")

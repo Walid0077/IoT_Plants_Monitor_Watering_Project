@@ -17,6 +17,21 @@ CMD_ACTUATOR = 0xA1
 ACTUATOR_OFF = 0x00
 ACTUATOR_ON = 0x01
 
+water_threshold = 0.7
+water_soon_threshold = 0.5
+monitor_threshold = 0.3
+incrm = 0   #modify this to water
+
+MQTT_TOPIC2 = "iot/gateway-001/updateparams"
+
+gateway_params = {
+    "fieldCapacity": 80.0,
+    "sampleFrequency": 10.0,
+    "soilVolumeLiters": 5.0,
+    "targetSoilMoisture": 55.0,
+    "wiltingPoint": 30.0,
+}
+
 
 def read_i2c_raw(bus, address, length):
     """
@@ -63,8 +78,48 @@ def decode_pico_packet(data_bytes):
 def on_connect(client, userdata, flags, rc):
     if rc == 0:
         print("Connected to MQTT broker")
+        update_topic = userdata.get("update_topic") if userdata else None
+        if update_topic:
+            client.subscribe(update_topic)
+            print(f"Subscribed to MQTT topic: {update_topic}")
     else:
         print(f"Failed to connect to MQTT broker. Return code: {rc}")
+
+
+def on_message(client, userdata, msg):
+    try:
+        payload = msg.payload.decode("utf-8")
+        payload_data = json.loads(payload)
+
+        if msg.topic != MQTT_TOPIC2:
+            return
+
+        allowed_keys = {
+            "fieldCapacity": float,
+            "sampleFrequency": float,
+            "soilVolumeLiters": float,
+            "targetSoilMoisture": float,
+            "wiltingPoint": float,
+        }
+
+        updated = []
+        for key, value in payload_data.items():
+            expected_type = allowed_keys.get(key)
+            if expected_type is None:
+                continue
+            gateway_params[key] = expected_type(value)
+            updated.append(key)
+
+        if updated:
+            print(f"Updated gateway parameters: {updated}")
+        else:
+            print("Received updateparams message but no recognized fields were found.")
+
+    except json.JSONDecodeError as e:
+        print(f"Invalid JSON in updateparams message: {e}")
+    except Exception as e:
+        print(f"Error processing updateparams message: {e}")
+
 
 def estimate_watering_decision(
     soil_moisture,
@@ -99,12 +154,14 @@ def estimate_watering_decision(
         0.7 * water_stress +
         0.3 * demand_index
     )
+    
 
-    if watering_need_index >= 0.7:
+
+    if watering_need_index >= water_threshold + incrm:
         decision = "water_now"
-    elif watering_need_index >= 0.5:
+    elif watering_need_index >= water_soon_threshold + incrm:
         decision = "water_soon"
-    elif watering_need_index >= 0.3:
+    elif watering_need_index >= monitor_threshold + incrm:
         decision = "monitor"
     else:
         decision = "no_water_needed"
@@ -199,6 +256,11 @@ def main():
 
     client = mqtt.Client(client_id=f"{args.gateway_id}-client")
     client.on_connect = on_connect
+    client.on_message = on_message
+    client.user_data_set({
+        "gateway_id": args.gateway_id,
+        "update_topic": MQTT_TOPIC2,
+    })
 
     print(f"Connecting to MQTT broker at {args.broker}:{args.port}...")
     client.connect(args.broker, args.port, keepalive=60)
@@ -226,22 +288,28 @@ def main():
                         "decoded": decoded
                     }
                     
-
                     watering_decision = estimate_watering_decision(
-                        decoded.moisture,
-                        decoded.temperature,
-                        decoded.humidity,
-                        decoded.light,
-                        field_capacity=70,
-                        wilting_point=25,
-                        target_soil_moisture=60,
-                        soil_volume_liters=5
+                        decoded["moisture"],
+                        decoded["temperature"],
+                        decoded["humidity"],
+                        decoded["light"],
+                        field_capacity=gateway_params["fieldCapacity"],
+                        wilting_point=gateway_params["wiltingPoint"],
+                        target_soil_moisture=gateway_params["targetSoilMoisture"],
+                        soil_volume_liters=gateway_params["soilVolumeLiters"]
                     )
+                    print(f"plant_available_water_percent: {watering_decision['plant_available_water_percent']}")
+                    print(f"water_stress_index: {watering_decision['water_stress_index']}")
+                    print(f"demand_index: {watering_decision['demand_index']}")
+                    print(f"watering_need_index: {watering_decision['watering_need_index']}")
+                    print(f"decision: {watering_decision['decision']}")
+                    print(f"estimated_water_liters: {watering_decision['estimated_water_liters']}")
+                    print(f"estimated_water_ml: {watering_decision['estimated_water_ml']}")
                     
-                    if(watering_decision.decision == "water_now"):
+                    if watering_decision["decision"] == "water_now":
                         bus.write_i2c_block_data(I2C_SLAVE_ADDRESS, CMD_ACTUATOR, [ACTUATOR_ON])
             
-                    estimated_water_liters
+                    # estimated_water_liters
 
                     print("\nReceived from Pico:")
                     print(json.dumps(packet, indent=4))
@@ -262,7 +330,7 @@ def main():
                 except Exception as e:
                     print(f"Unexpected error: {e}")
 
-                time.sleep(args.sample_frequency)
+                time.sleep(gateway_params.get("sampleFrequency", args.sample_frequency))
 
     except KeyboardInterrupt:
         print("\nStopping IoT Gateway...")
