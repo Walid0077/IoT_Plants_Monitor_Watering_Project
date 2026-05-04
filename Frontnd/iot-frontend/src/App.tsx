@@ -380,12 +380,12 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
       anchoredPredictionValues,
       metric.range,
     );
-    const chartWidth = 520;
-    const chartHeight = 276;
-    const padLeft = 56;
-    const padRight = 18;
-    const padTop = 18;
-    const padBottom = 46;
+    const chartWidth = 1040;
+    const chartHeight = 360;
+    const padLeft = 64;
+    const padRight = 28;
+    const padTop = 22;
+    const padBottom = 54;
     const latestIndex = Math.max(values.length - 1, 0);
     const totalSteps = Math.max(latestIndex + predictions.length, 1);
 
@@ -411,7 +411,7 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
       const ratio = index / 4;
       return maxY - (maxY - minY) * ratio;
     });
-    const xAxisLabels = [
+    const rawXAxisLabels = [
       ...values.map((_value, index) => ({
         x: toX(index),
         label: index === latestIndex ? "current" : String(index - latestIndex),
@@ -423,6 +423,18 @@ function TrendChart({metric,predictionSteps,predictions,readings,}: {
         isCurrent: false,
       })),
     ];
+    const maxXAxisLabels = 24;
+    const xAxisLabelInterval = Math.max(
+      1,
+      Math.ceil(rawXAxisLabels.length / maxXAxisLabels),
+    );
+    const xAxisLabels = rawXAxisLabels.filter(
+      (label, index) =>
+        label.isCurrent ||
+        index === 0 ||
+        index === rawXAxisLabels.length - 1 ||
+        index % xAxisLabelInterval === 0,
+    );
 
     return (
       <article className="chart-card">

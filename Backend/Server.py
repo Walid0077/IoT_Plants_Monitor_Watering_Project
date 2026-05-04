@@ -1,4 +1,5 @@
 import json
+import random
 import threading
 from datetime import datetime, timezone
 from statsmodels.tsa.arima.model import ARIMA
@@ -357,39 +358,185 @@ def predict_least_squares(values, steps):
     ]
 
 
+def mean_value(values):
+    return sum(values) / len(values) if values else 0
+
+
+def sum_squared_error(values):
+    if not values:
+        return 0
+
+    mean = mean_value(values)
+    return sum((value - mean) ** 2 for value in values)
+
+
+def build_regression_tree(samples, depth=0, max_depth=3, min_leaf_size=2):
+    values = [sample[1] for sample in samples]
+
+    if depth >= max_depth or len(samples) <= min_leaf_size * 2:
+        return {"value": mean_value(values)}
+
+    samples = sorted(samples, key=lambda sample: sample[0])
+    best_index = None
+    best_loss = None
+
+    for index in range(min_leaf_size, len(samples) - min_leaf_size + 1):
+        left_samples = samples[:index]
+        right_samples = samples[index:]
+
+        if left_samples[-1][0] == right_samples[0][0]:
+            continue
+
+        loss = (
+            sum_squared_error([sample[1] for sample in left_samples])
+            + sum_squared_error([sample[1] for sample in right_samples])
+        )
+
+        if best_loss is None or loss < best_loss:
+            best_index = index
+            best_loss = loss
+
+    if best_index is None:
+        return {"value": mean_value(values)}
+
+    threshold = (samples[best_index - 1][0] + samples[best_index][0]) / 2
+    left_samples = [sample for sample in samples if sample[0] <= threshold]
+    right_samples = [sample for sample in samples if sample[0] > threshold]
+
+    if not left_samples or not right_samples:
+        return {"value": mean_value(values)}
+
+    return {
+        "threshold": threshold,
+        "left": build_regression_tree(
+            left_samples,
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf_size=min_leaf_size,
+        ),
+        "right": build_regression_tree(
+            right_samples,
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf_size=min_leaf_size,
+        ),
+    }
+
+
+def predict_regression_tree(tree, index):
+    if "value" in tree:
+        return tree["value"]
+
+    if index <= tree["threshold"]:
+        return predict_regression_tree(tree["left"], index)
+
+    return predict_regression_tree(tree["right"], index)
+
+
+def predict_decision_tree(values, steps):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) < 4:
+        return predict_least_squares(values, steps)
+
+    samples = [(index, float(value)) for index, value in enumerate(values)]
+    tree = build_regression_tree(samples)
+
+    return [
+        round(float(predict_regression_tree(tree, len(values) + step)), 2)
+        for step in range(steps)
+    ]
+
+
+def predict_random_forest(values, steps, tree_count=25):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) < 4:
+        return predict_least_squares(values, steps)
+
+    samples = [(index, float(value)) for index, value in enumerate(values)]
+    min_leaf_size = max(1, min(4, len(samples) // 6))
+    random_source = random.Random(len(values) * 1009 + steps)
+    forecasts = []
+
+    for tree_index in range(tree_count):
+        bootstrap_samples = [
+            random_source.choice(samples)
+            for _sample in samples
+        ]
+        tree = build_regression_tree(
+            bootstrap_samples,
+            max_depth=2 + (tree_index % 3),
+            min_leaf_size=min_leaf_size,
+        )
+        forecasts.append([
+            predict_regression_tree(tree, len(values) + step)
+            for step in range(steps)
+        ])
+
+    return [
+        round(sum(forecast[step] for forecast in forecasts) / len(forecasts), 2)
+        for step in range(steps)
+    ]
+
+
+def normalize_prediction_algorithm(algorithm):
+    normalized = algorithm.strip().lower().replace("_", " ").replace("-", " ")
+
+    aliases = {
+        "least square": "least_square",
+        "least squares": "least_square",
+        "linear least squares": "least_square",
+        "linear least square": "least_square",
+        "arima": "arima",
+        "prophet": "prophet",
+        "decision tree": "decision_tree",
+        "random forest": "random_forest",
+    }
+
+    return aliases.get(normalized, "least_square")
+
+
+def predict_values(values, steps, algorithm):
+    if algorithm == "arima":
+        return predict_arima(values, steps)
+
+    if algorithm == "prophet":
+        return predict_prophet(values, steps)
+
+    if algorithm == "decision_tree":
+        return predict_decision_tree(values, steps)
+
+    if algorithm == "random_forest":
+        return predict_random_forest(values, steps)
+
+    return predict_least_squares(values, steps)
+
+
 @app.get("/api/predictions")
-def get_predictions(steps: int = 10, limit: int = 28):
+def get_predictions(steps: int = 10, limit: int = 28, algorithm: str = "least square"):
     steps = max(0, min(steps, 100))
     limit = max(2, min(limit, 500))
+    prediction_algorithm = normalize_prediction_algorithm(algorithm)
     documents = list(newest_documents(limit))
     documents.reverse()
-    # print(documents)
 
-    response = {}
-    #     "steps": steps,
-    #     "generated_at": datetime.now(timezone.utc).isoformat(),
-    # }
-
-        
-    result = {}
-    method = "linear_least_squares" #rolling-window linear regression trend extrapolation
-    #but it is not a full time-series forecasting model like ARIMA, exponential smoothing, Prophet, or an LSTM.
-    
+    metric_values = {key: [] for key in METRIC_FIELD_NAMES}
 
     for doc in documents:
-        for key, value in METRIC_FIELD_NAMES.items():
-            if isinstance(doc[value], (int, float)) and not isinstance(value, bool):
-                if key not in result:
-                    result[key] = []
+        for key, field_name in METRIC_FIELD_NAMES.items():
+            value = read_numeric_field(doc, [field_name])
 
-                result[key].append(doc[value])
-            # print(value)
-            if(method == "linear_least_squares"):
-                response[value] = predict_least_squares(result[value], steps)
-            elif(method == "arima"):
-                response[value] = predict_arima(result[value], steps)
-            elif(method == "prophet"):
-                response[value] = predict_prophet(result[value], steps)
+            if value is not None:
+                metric_values[key].append(value)
+
+    response = {
+        key: predict_values(values, steps, prediction_algorithm)
+        for key, values in metric_values.items()
+    }
+
     return response
 
 
