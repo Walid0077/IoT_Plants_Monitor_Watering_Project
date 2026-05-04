@@ -41,8 +41,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Canopy climate",
     unit: "C",
     range: [8, 38],
-    color: "#dc7a27",
-    predictionColor: "#f1b46a",
+    color: "#f43f5e",
+    predictionColor: "#fb7185",
   },
   {
     key: "light",
@@ -50,8 +50,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Leaf exposure",
     unit: "lx",
     range: [0, 1200],
-    color: "#9d7c16",
-    predictionColor: "#d9b943",
+    color: "#eab308",
+    predictionColor: "#fde047",
   },
   {
     key: "moisture",
@@ -59,8 +59,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Soil water",
     unit: "%",
     range: [0, 100],
-    color: "#168263",
-    predictionColor: "#62c2a4",
+    color: "#10b981",
+    predictionColor: "#6ee7b7",
   },
   {
     key: "humidity",
@@ -68,8 +68,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Greenhouse air",
     unit: "%",
     range: [0, 100],
-    color: "#247f9e",
-    predictionColor: "#74c1d3",
+    color: "#06b6d4",
+    predictionColor: "#67e8f9",
   },
 ];
 
@@ -142,7 +142,7 @@ function normalizeReading(
   }
 
   const receivedAt =
-    asString(source, ["timestamp"]) ?? fallbackReceivedAt;
+    asString(source, ["received_at", "timestamp"]) ?? fallbackReceivedAt;
 
   return {
     id: asString(source, ["id", "_id"]) ?? receivedAt,
@@ -210,7 +210,7 @@ function normalizePredictions(payload: unknown): Predictions {
   const normalized = emptyPredictions();
 
   metrics.forEach((metric) => {
-    for (const key of predictionSourceKeys[metric.key]) {
+    for (const key of [predictionSourceKeys[metric.key]]) {
       const values = normalizeNumberArray(source[key]);
 
       if (values.length > 0 || Array.isArray(source[key])) {

@@ -109,10 +109,7 @@ def read_numeric_field(document, field_names):
     return None
 
 
-def predict_next_values(values, steps):
-    print(f" stps {steps}")
-    print(f" valus {values}")
-    
+def predict_next_values(values, steps):    
     if steps <= 0 or not values:
         return []
 
@@ -289,25 +286,28 @@ def get_predictions(steps: int = 10, limit: int = 28):
     limit = max(2, min(limit, 500))
     documents = list(newest_documents(limit))
     documents.reverse()
-    # print(documents)
 
     response = {
         "steps": steps,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "predictions": {},
     }
 
-        
     result = {}
 
     for doc in documents:
-        for key, value in METRIC_FIELD_NAMES.items():
-            if isinstance(doc[value], (int, float)) and not isinstance(value, bool):
+        for key, field_name in METRIC_FIELD_NAMES.items():
+            val = doc.get(field_name)
+            if isinstance(val, (int, float)) and not isinstance(val, bool):
                 if key not in result:
                     result[key] = []
+                result[key].append(val)
 
-                result[key].append(doc[value])
-            # response[value] = predict_next_values(result[value], steps)
-    print(result)
+    for key, values in result.items():
+        if values:
+            response["predictions"][key] = predict_next_values(values, steps)
+
+    return response
 
 
 class UpdateParams(BaseModel):
