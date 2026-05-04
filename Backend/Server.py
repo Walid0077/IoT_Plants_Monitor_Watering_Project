@@ -1,13 +1,15 @@
 import json
 import threading
 from datetime import datetime, timezone
-
+from statsmodels.tsa.arima.model import ARIMA
 import paho.mqtt.client as mqtt
 from pymongo import MongoClient, DESCENDING
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import pandas as pd
+from prophet import Prophet
 
 
 # -----------------------------
@@ -108,35 +110,6 @@ def read_numeric_field(document, field_names):
 
     return None
 
-
-def predict_next_values(values, steps):
-    print(f" stps {steps}")
-    print(f" valus {values}")
-    
-    if steps <= 0 or not values:
-        return []
-
-    if len(values) == 1:
-        return [round(values[0], 2) for _ in range(steps)]
-
-    recent_values = values[-8:]
-    mean_x = (len(recent_values) - 1) / 2
-    mean_y = sum(recent_values) / len(recent_values)
-    numerator = sum(
-        (index - mean_x) * (value - mean_y)
-        for index, value in enumerate(recent_values)
-    )
-    denominator = sum(
-        (index - mean_x) ** 2
-        for index, _value in enumerate(recent_values)
-    )
-    slope = numerator / denominator if denominator else 0
-    latest = recent_values[-1]
-
-    return [
-        round(latest + slope * (step + 1), 2)
-        for step in range(steps)
-    ]
 
 
 def store_sensor_data(data):
@@ -283,6 +256,107 @@ def get_latest_sensor_data():
     return serialize_document(document)
 
 
+
+def predict_arima(values, steps, order=(1, 1, 1)):
+    """
+    Forecast future values using ARIMA.
+
+    values: list of historical sensor values
+    steps: number of future values to predict
+    order: ARIMA(p, d, q), default is (1, 1, 1)
+    """
+
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+    # ARIMA needs enough data to fit reliably.
+    # If too few values are available, use a simple fallback.
+    if len(values) < 8:
+        latest = values[-1]
+        return [round(latest, 2) for _ in range(steps)]
+
+    try:
+        model = ARIMA(values, order=order)
+        fitted_model = model.fit()
+
+        forecast = fitted_model.forecast(steps=steps)
+
+        return [round(float(value), 2) for value in forecast]
+
+    except Exception as e:
+        print(f"ARIMA prediction failed: {e}")
+
+        # Safe fallback: repeat latest value
+        latest = values[-1]
+        return [round(latest, 2) for _ in range(steps)]
+
+def predict_prophet(values, steps):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+ 
+
+    # Prophet requires columns named ds and y
+    df = pd.DataFrame({
+        "ds": pd.date_range(start="2024-01-01", periods=len(values), freq="D"),
+        "y": values
+    })
+
+    model = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality=False,
+        yearly_seasonality=False
+    )
+
+    model.fit(df)
+
+    future = model.make_future_dataframe(periods=steps, freq="D")
+    forecast = model.predict(future)
+
+    predictions = forecast["yhat"].tail(steps)
+
+    return [
+        round(value, 2)
+        for value in predictions
+    ]
+
+def predict_least_squares(values, steps):
+
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+    recent_values = values[-8:]
+    mean_x = (len(recent_values) - 1) / 2
+    mean_y = sum(recent_values) / len(recent_values)
+    
+    numerator = sum(
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(recent_values)
+    )
+    
+    denominator = sum(
+        (index - mean_x) ** 2
+        for index, _value in enumerate(recent_values)
+    )
+    
+    slope = numerator / denominator if denominator else 0
+    latest = recent_values[-1]
+
+    return [
+        round(latest + slope * (step + 1), 2)
+        for step in range(steps)
+    ]
+
+
 @app.get("/api/predictions")
 def get_predictions(steps: int = 10, limit: int = 28):
     steps = max(0, min(steps, 100))
@@ -291,13 +365,16 @@ def get_predictions(steps: int = 10, limit: int = 28):
     documents.reverse()
     # print(documents)
 
-    response = {
-        "steps": steps,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    response = {}
+    #     "steps": steps,
+    #     "generated_at": datetime.now(timezone.utc).isoformat(),
+    # }
 
         
     result = {}
+    method = "linear_least_squares" #rolling-window linear regression trend extrapolation
+    #but it is not a full time-series forecasting model like ARIMA, exponential smoothing, Prophet, or an LSTM.
+    
 
     for doc in documents:
         for key, value in METRIC_FIELD_NAMES.items():
@@ -306,8 +383,14 @@ def get_predictions(steps: int = 10, limit: int = 28):
                     result[key] = []
 
                 result[key].append(doc[value])
-            # response[value] = predict_next_values(result[value], steps)
-    print(result)
+            # print(value)
+            if(method == "linear_least_squares"):
+                response[value] = predict_least_squares(result[value], steps)
+            elif(method == "arima"):
+                response[value] = predict_arima(result[value], steps)
+            elif(method == "prophet"):
+                response[value] = predict_prophet(result[value], steps)
+    return response
 
 
 class UpdateParams(BaseModel):
