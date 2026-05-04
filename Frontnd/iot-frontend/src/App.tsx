@@ -1,18 +1,46 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000"
-).replace(/\/$/, "");
+const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000").replace(/\/$/, "");
 const HISTORY_LIMIT = 28;
 const POLL_INTERVAL_MS = 3000;
 const PREDICTION_STEPS = 10;
 
 type MetricKey = "temperature" | "light" | "moisture" | "humidity";
 type FeedMode = "live" | "demo";
+type PredictionAlgorithm =
+  | "least square"
+  | "ARIMA"
+  | "Prophet"
+  | "Decision Tree"
+  | "random forest";
 
 type RawSensorReading = Record<string, unknown>;
 type Predictions = Record<MetricKey, number[]>;
+
+const predictionAlgorithms: PredictionAlgorithm[] = [
+  "least square",
+  "ARIMA",
+  "Prophet",
+  "Decision Tree",
+  "random forest",
+];
+
+type PlantParams = {
+  sampleFrequency: number;
+  fieldCapacity: number;
+  wiltingPoint: number;
+  targetSoilMoisture: number;
+  soilVolumeLiters: number;
+};
+
+const DEFAULT_PLANT_PARAMS: PlantParams = {
+  sampleFrequency: 10,
+  fieldCapacity: 80,
+  wiltingPoint: 30,
+  targetSoilMoisture: 55,
+  soilVolumeLiters: 5,
+};
 
 type PlantReading = {
   id: string;
@@ -41,8 +69,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Canopy climate",
     unit: "C",
     range: [8, 38],
-    color: "#f43f5e",
-    predictionColor: "#fb7185",
+    color: "#dc7a27",
+    predictionColor: "#f1b46a",
   },
   {
     key: "light",
@@ -50,8 +78,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Leaf exposure",
     unit: "lx",
     range: [0, 1200],
-    color: "#eab308",
-    predictionColor: "#fde047",
+    color: "#9d7c16",
+    predictionColor: "#d9b943",
   },
   {
     key: "moisture",
@@ -59,8 +87,8 @@ const metrics: MetricConfig[] = [
     subtitle: "Soil water",
     unit: "%",
     range: [0, 100],
-    color: "#10b981",
-    predictionColor: "#6ee7b7",
+    color: "#168263",
+    predictionColor: "#62c2a4",
   },
   {
     key: "humidity",
@@ -68,16 +96,17 @@ const metrics: MetricConfig[] = [
     subtitle: "Greenhouse air",
     unit: "%",
     range: [0, 100],
-    color: "#06b6d4",
-    predictionColor: "#67e8f9",
+    color: "#247f9e",
+    predictionColor: "#74c1d3",
   },
 ];
 
-const predictionSourceKeys: Record<MetricKey, string> = {
-  temperature: "temperature",
-  light: "light",
-  moisture  :"moisture",
-  humidity: "humidity",
+
+const predictionSourceKeys: Record<MetricKey, string[]> = {
+  temperature: ["temperature"],
+  light: ["light"],
+  moisture: ["moisture"],
+  humidity: ["humidity"],
 };
 
 function emptyPredictions(): Predictions {
@@ -130,19 +159,18 @@ function asString(source: RawSensorReading, keys: string[]) {
 }
 
 function normalizeReading(
-  source: RawSensorReading,fallbackReceivedAt = new Date().toISOString(),
-): PlantReading | null {
+  source: RawSensorReading,fallbackReceivedAt = new Date().toISOString()): PlantReading | null {
   const temperature = asNumber(source, ["temperature"]);
-  const light = asNumber(source, ["light"]);
-  const moisture = asNumber(source, ["moisture"]);
-  const humidity = asNumber(source, ["humidity",]);
+  const light       = asNumber(source, ["light"]);
+  const moisture    = asNumber(source, ["moisture"]);
+  const humidity    = asNumber(source, ["humidity",]);
 
-  if (temperature === null &&light === null &&moisture === null &&humidity === null) {
+  if (temperature === null && light === null && moisture === null && humidity === null) {
     return null;
   }
 
   const receivedAt =
-    asString(source, ["received_at", "timestamp"]) ?? fallbackReceivedAt;
+    asString(source, ["timestamp"]) ?? fallbackReceivedAt;
 
   return {
     id: asString(source, ["id", "_id"]) ?? receivedAt,
@@ -166,20 +194,14 @@ function normalizeHistory(payload: unknown) {
     .map((item, index) =>
       normalizeReading(
         item as RawSensorReading,
-        new Date(
-          newestFallbackTimestamp - index * POLL_INTERVAL_MS,
-        ).toISOString(),
+        new Date(newestFallbackTimestamp - index * POLL_INTERVAL_MS,).toISOString(),
       ),
     )
     .filter((item): item is PlantReading => item !== null)
-    .sort(
-      (a, b) =>
-        new Date(a.receivedAt).getTime() - new Date(b.receivedAt).getTime(),
-    )
-    .slice(-HISTORY_LIMIT);
+    .sort((a, b) =>new Date(a.receivedAt).getTime() - new Date(b.receivedAt).getTime(),).slice(-HISTORY_LIMIT);
 }
 
-function normalizeNumberArray(value: unknown) {
+function normalizeNumberArray(value: unknown, predictionSteps: number) {
   if (!Array.isArray(value)) {
     return [];
   }
@@ -198,20 +220,24 @@ function normalizeNumberArray(value: unknown) {
       return null;
     })
     .filter((item): item is number => item !== null)
-    .slice(0, PREDICTION_STEPS);
+    .slice(0, predictionSteps);
 }
 
-function normalizePredictions(payload: unknown): Predictions {
-  if (!isRecord(payload)) {
+function normalizePredictions(payload: unknown, predictionSteps: number): Predictions {
+  const source =
+    isRecord(payload) && isRecord(payload.predictions)
+      ? payload.predictions
+      : payload;
+
+  if (!isRecord(source)) {
     return emptyPredictions();
   }
 
-  const source = isRecord(payload.predictions) ? payload.predictions : payload;
   const normalized = emptyPredictions();
 
   metrics.forEach((metric) => {
-    for (const key of [predictionSourceKeys[metric.key]]) {
-      const values = normalizeNumberArray(source[key]);
+    for (const key of predictionSourceKeys[metric.key]) {
+      const values = normalizeNumberArray(source[key], predictionSteps);
 
       if (values.length > 0 || Array.isArray(source[key])) {
         normalized[metric.key] = values;
@@ -223,21 +249,7 @@ function normalizePredictions(payload: unknown): Predictions {
   return normalized;
 }
 
-type PlantParams = {
-  sampleFrequency: number;
-  fieldCapacity: number;
-  wiltingPoint: number;
-  targetSoilMoisture: number;
-  soilVolumeLiters: number;
-};
 
-const DEFAULT_PLANT_PARAMS: PlantParams = {
-  sampleFrequency: 10,
-  fieldCapacity: 80,
-  wiltingPoint: 30,
-  targetSoilMoisture: 55,
-  soilVolumeLiters: 5,
-};
 
 async function fetchJson<T>(path: string): Promise<T> {
   const response = await fetch(`${API_BASE_URL}${path}`);
@@ -253,40 +265,36 @@ function clamp(value: number, min: number, max: number) {
   return Math.min(max, Math.max(min, value));
 }
 
-function drift(value: number, min: number, max: number, amount: number) {
-  return clamp(value + (Math.random() - 0.45) * amount, min, max);
-}
+// function createDemoReading(previous?: PlantReading, timestamp = Date.now()) {
+//   const wave = Math.sin(timestamp / 45000);
+//   const temperature = previous?.temperature ?? 22 + wave * 1.6;
+//   const light = previous?.light ?? 620 + Math.max(0, wave) * 180;
+//   const moisture = previous?.moisture ?? 58 - wave * 5;
+//   const humidity = previous?.humidity ?? 64 + wave * 4;
 
-function createDemoReading(previous?: PlantReading, timestamp = Date.now()) {
-  const wave = Math.sin(timestamp / 45000);
-  const temperature = previous?.temperature ?? 22 + wave * 1.6;
-  const light = previous?.light ?? 620 + Math.max(0, wave) * 180;
-  const moisture = previous?.moisture ?? 58 - wave * 5;
-  const humidity = previous?.humidity ?? 64 + wave * 4;
+//   return {
+//     id: `demo-${timestamp}`,
+//     gatewayId: "demo-greenhouse",
+//     receivedAt: new Date(timestamp).toISOString(),
+//     temperature: Number(drift(temperature, 14, 34, 0.55).toFixed(1)),
+//     light: Math.round(drift(light, 80, 1100, 55)),
+//     moisture: Number(drift(moisture, 20, 92, 1.3).toFixed(1)),
+//     humidity: Number(drift(humidity, 28, 94, 1.4).toFixed(1)),
+//   };
+// }
 
-  return {
-    id: `demo-${timestamp}`,
-    gatewayId: "demo-greenhouse",
-    receivedAt: new Date(timestamp).toISOString(),
-    temperature: Number(drift(temperature, 14, 34, 0.55).toFixed(1)),
-    light: Math.round(drift(light, 80, 1100, 55)),
-    moisture: Number(drift(moisture, 20, 92, 1.3).toFixed(1)),
-    humidity: Number(drift(humidity, 28, 94, 1.4).toFixed(1)),
-  };
-}
+// function createDemoHistory() {
+//     let previous: PlantReading ;
+//     const firstTimestamp = Date.now() - (HISTORY_LIMIT - 1) * POLL_INTERVAL_MS;
 
-function createDemoHistory() {
-    let previous: PlantReading ;
-    const firstTimestamp = Date.now() - (HISTORY_LIMIT - 1) * POLL_INTERVAL_MS;
-
-    return Array.from({ length: HISTORY_LIMIT }, (_, index) => {
-      previous = createDemoReading(
-        previous,
-        firstTimestamp + index * POLL_INTERVAL_MS,
-      );
-      return previous;
-    });
-  }
+//     return Array.from({ length: HISTORY_LIMIT }, (_, index) => {
+//       previous = createDemoReading(
+//         previous,
+//         firstTimestamp + index * POLL_INTERVAL_MS,
+//       );
+//       return previous;
+//     });
+//   }
 
 function sameReading(a: PlantReading, b: PlantReading) {
   return a.id === b.id || a.receivedAt === b.receivedAt;
@@ -354,33 +362,30 @@ function metricDomain(
     return [min - padding, max + padding] as const;
   }
 
-function TrendChart({
-    metric,
-    predictions,
-    readings,
-  }: {
+function TrendChart({metric,predictionSteps,predictions,readings,}: {
     metric: MetricConfig;
+    predictionSteps: number;
     predictions: number[];
     readings: PlantReading[];
   }) {
-    const visibleReadings = readings.slice(-(PREDICTION_STEPS + 1));
+    const visibleReadings = readings.slice(-(predictionSteps + 1));
     const values = visibleReadings.map((reading) => reading[metric.key]);
     const latestValue = values.filter((value) => value !== null).at(-1) ?? null;
     const anchoredPredictionValues =
       latestValue === null
         ? []
-        : [latestValue, ...predictions.slice(0, PREDICTION_STEPS)];
+        : [latestValue, ...predictions.slice(0, predictionSteps)];
     const [minY, maxY] = metricDomain(
       values,
       anchoredPredictionValues,
       metric.range,
     );
-    const chartWidth = 520;
-    const chartHeight = 276;
-    const padLeft = 56;
-    const padRight = 18;
-    const padTop = 18;
-    const padBottom = 46;
+    const chartWidth = 1040;
+    const chartHeight = 360;
+    const padLeft = 64;
+    const padRight = 28;
+    const padTop = 22;
+    const padBottom = 54;
     const latestIndex = Math.max(values.length - 1, 0);
     const totalSteps = Math.max(latestIndex + predictions.length, 1);
 
@@ -406,18 +411,30 @@ function TrendChart({
       const ratio = index / 4;
       return maxY - (maxY - minY) * ratio;
     });
-    const xAxisLabels = [
+    const rawXAxisLabels = [
       ...values.map((_value, index) => ({
         x: toX(index),
         label: index === latestIndex ? "current" : String(index - latestIndex),
         isCurrent: index === latestIndex,
       })),
-      ...predictions.slice(0, PREDICTION_STEPS).map((_value, index) => ({
+      ...predictions.slice(0, predictionSteps).map((_value, index) => ({
         x: toX(latestIndex + index + 1),
         label: `+${index + 1}`,
         isCurrent: false,
       })),
     ];
+    const maxXAxisLabels = 24;
+    const xAxisLabelInterval = Math.max(
+      1,
+      Math.ceil(rawXAxisLabels.length / maxXAxisLabels),
+    );
+    const xAxisLabels = rawXAxisLabels.filter(
+      (label, index) =>
+        label.isCurrent ||
+        index === 0 ||
+        index === rawXAxisLabels.length - 1 ||
+        index % xAxisLabelInterval === 0,
+    );
 
     return (
       <article className="chart-card">
@@ -434,7 +451,7 @@ function TrendChart({
             className="chart"
             role="img"
             viewBox={`0 0 ${chartWidth} ${chartHeight}`}
-            aria-label={`${metric.title} history and backend prediction for ${PREDICTION_STEPS} steps`}
+            aria-label={`${metric.title} history and backend prediction for ${predictionSteps} steps`}
           >
             {yAxisTicks.map((tick) => {
               const y = toY(tick);
@@ -457,12 +474,7 @@ function TrendChart({
               );
             })}
 
-            <path
-              className="axis-line"
-              d={`M ${padLeft} ${padTop} V ${chartHeight - padBottom} H ${
-                chartWidth - padRight
-              }`}
-            />
+            <path className="axis-line" d={`M ${padLeft} ${padTop} V ${chartHeight - padBottom} H ${chartWidth - padRight}`}/>
 
             {xAxisLabels.map((label, index) => (
               <text
@@ -472,11 +484,9 @@ function TrendChart({
                 key={`${label.label}-${index}`}
                 x={label.x}
                 y={chartHeight - 17}
-                textAnchor="middle"
-              >
+                textAnchor="middle">
                 {label.label}
-              </text>
-            ))}
+              </text>))}
 
             <path
               className="actual-line"
@@ -511,6 +521,7 @@ function TrendChart({
           <span>
             <i className="legend actual" style={{ background: metric.color }} />
             live history
+
           </span>
           <span>
             <i
@@ -526,9 +537,7 @@ function TrendChart({
 
 function App() {
     const [readings, setReadings] = useState<PlantReading[]>([]);
-    const [predictionData, setPredictionData] = useState<Predictions>(() =>
-      emptyPredictions(),
-    );
+    const [predictionData, setPredictionData] = useState<Predictions>(() =>emptyPredictions(),);
     const [feedMode, setFeedMode] = useState<FeedMode>("live");
     const [dataNotice, setDataNotice] = useState("");
     const [predictionNotice, setPredictionNotice] = useState("");
@@ -536,6 +545,9 @@ function App() {
     const [paramsError, setParamsError] = useState("");
     const [isUpdatingParams, setIsUpdatingParams] = useState(false);
     const [params, setParams] = useState<PlantParams>(() => DEFAULT_PLANT_PARAMS);
+    const [predictionSteps, setPredictionSteps] = useState(PREDICTION_STEPS);
+    const [predictionAlgorithm, setPredictionAlgorithm] =
+      useState<PredictionAlgorithm>("least square");
 
     const latestReading = readings.at(-1) ?? null;
     const rows = useMemo(() => readings.slice(-8).reverse(), [readings]);
@@ -549,6 +561,14 @@ function App() {
         ...current,
         [key]: Number(value),
       }));
+    };
+
+    const handlePredictionStepsChange = (value: string) => {
+      const nextSteps = Number(value);
+
+      setPredictionSteps(
+        Number.isFinite(nextSteps) ? clamp(Math.round(nextSteps), 1, 100) : 1,
+      );
     };
 
     const updateParams = async () => {
@@ -590,9 +610,7 @@ function App() {
 
       async function loadHistory() {
         try {
-          const payload = await fetchJson<unknown>(
-            `/api/sensor-data?limit=${HISTORY_LIMIT}`,
-          );
+          const payload = await fetchJson<unknown>(`/api/sensor-data?limit=${HISTORY_LIMIT}`);
           const history = normalizeHistory(payload);
 
           if (cancelled || history.length === 0) {
@@ -604,21 +622,15 @@ function App() {
           setDataNotice("");
         } catch (error) {
           console.error(error);
-
-          if (!cancelled) {
-            setReadings(createDemoHistory());
-            setFeedMode("demo");
-            setDataNotice("API unavailable. Showing generated sample readings.");
-          }
         }
       }
 
       async function fetchPredictions() {
         try {
           const payload = await fetchJson<unknown>(
-            `/api/predictions?steps=${PREDICTION_STEPS}`,
+            `/api/predictions?steps=${predictionSteps}&algorithm=${encodeURIComponent(predictionAlgorithm)}`,
           );
-          const normalized = normalizePredictions(payload);
+          const normalized = normalizePredictions(payload, predictionSteps);
 
           if (!cancelled) {
             setPredictionData(normalized);
@@ -660,15 +672,15 @@ function App() {
       } catch (error) {
         console.error(error);
 
-        if (!cancelled) {
-          setReadings((current) => {
-            const seed =
-              current.length > 0 ? current : createDemoHistory().slice(0, -1);
-            return appendReading(seed, createDemoReading(seed.at(-1)));
-          });
-          setFeedMode("demo");
-          setDataNotice("API unavailable. Showing generated sample readings.");
-        }
+        // if (!cancelled) {
+        //   setReadings((current) => {
+        //     const seed =
+        //       current.length > 0 ? current : createDemoHistory().slice(0, -1);
+        //     return appendReading(seed, createDemoReading(seed.at(-1)));
+        //   });
+        //   setFeedMode("demo");
+        //   setDataNotice("API unavailable. Showing generated sample readings.");
+        // }
       }
     }
 
@@ -683,7 +695,7 @@ function App() {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, []);
+  }, [predictionAlgorithm, predictionSteps]);
 
   return (
     <main className="dashboard">
@@ -693,7 +705,7 @@ function App() {
           <h1>Greenhouse health dashboard</h1>
           <p className="header-copy">
             Rolling sensor history, latest values, and backend predictions for
-            the next {PREDICTION_STEPS} incoming samples.
+            the next {predictionSteps} incoming samples using {predictionAlgorithm}.
           </p>
         </div>
 
@@ -719,14 +731,14 @@ function App() {
         <p className="notice notice-error">{paramsError}</p>
       )}
 
-      <section className="settings-section">
-        <div className="section-heading">
+      <section className="settings-form" aria-labelledby="settings-title">
+        <div className="settings-header">
           <div>
             <p className="eyebrow">Plant settings</p>
-            <h2>Update sampling and pot parameters</h2>
+            <h2 id="settings-title">Update sampling and prediction settings</h2>
           </div>
           <button
-            className="primary-button"
+            className="button"
             type="button"
             onClick={updateParams}
             disabled={isUpdatingParams}
@@ -736,20 +748,18 @@ function App() {
         </div>
 
         <div className="settings-grid">
-          <label>
+          <label className="form-group">
             Sample frequency
             <input
               type="number"
               min={1}
               step={1}
               value={params.sampleFrequency}
-              onChange={(event) =>
-                handleParamChange("sampleFrequency", event.target.value)
-              }
+              onChange={(event) =>handleParamChange("sampleFrequency", event.target.value)}
             />
           </label>
 
-          <label>
+          <label className="form-group">
             Field capacity (%)
             <input
               type="number"
@@ -760,10 +770,10 @@ function App() {
               onChange={(event) =>
                 handleParamChange("fieldCapacity", event.target.value)
               }
-            />
+              />
           </label>
 
-          <label>
+          <label className="form-group">
             Wilting point (%)
             <input
               type="number"
@@ -777,7 +787,7 @@ function App() {
             />
           </label>
 
-          <label>
+          <label className="form-group">
             Target soil moisture (%)
             <input
               type="number"
@@ -788,10 +798,10 @@ function App() {
               onChange={(event) =>
                 handleParamChange("targetSoilMoisture", event.target.value)
               }
-            />
+              />
           </label>
 
-          <label>
+          <label className="form-group">
             Soil volume (L)
             <input
               type="number"
@@ -803,6 +813,34 @@ function App() {
               }
             />
           </label>
+
+          <label className="form-group">
+            Steps to predict
+            <input
+              type="number"
+              min={1}
+              max={100}
+              step={1}
+              value={predictionSteps}
+              onChange={(event) => handlePredictionStepsChange(event.target.value)}
+            />
+          </label>
+
+          <label className="form-group">
+            Prediction algorithm
+            <select
+              value={predictionAlgorithm}
+              onChange={(event) =>
+                setPredictionAlgorithm(event.target.value as PredictionAlgorithm)
+              }
+            >
+              {predictionAlgorithms.map((algorithm) => (
+                <option key={algorithm} value={algorithm}>
+                  {algorithm}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
       </section>
 
@@ -811,6 +849,7 @@ function App() {
           <TrendChart
             key={metric.key}
             metric={metric}
+            predictionSteps={predictionSteps}
             predictions={predictionData[metric.key]}
             readings={readings}
           />

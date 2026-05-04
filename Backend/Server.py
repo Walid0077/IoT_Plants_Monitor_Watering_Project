@@ -1,13 +1,16 @@
 import json
+import random
 import threading
 from datetime import datetime, timezone
-
+from statsmodels.tsa.arima.model import ARIMA
 import paho.mqtt.client as mqtt
 from pymongo import MongoClient, DESCENDING
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import pandas as pd
+from prophet import Prophet
 
 
 # -----------------------------
@@ -108,32 +111,6 @@ def read_numeric_field(document, field_names):
 
     return None
 
-
-def predict_next_values(values, steps):    
-    if steps <= 0 or not values:
-        return []
-
-    if len(values) == 1:
-        return [round(values[0], 2) for _ in range(steps)]
-
-    recent_values = values[-8:]
-    mean_x = (len(recent_values) - 1) / 2
-    mean_y = sum(recent_values) / len(recent_values)
-    numerator = sum(
-        (index - mean_x) * (value - mean_y)
-        for index, value in enumerate(recent_values)
-    )
-    denominator = sum(
-        (index - mean_x) ** 2
-        for index, _value in enumerate(recent_values)
-    )
-    slope = numerator / denominator if denominator else 0
-    latest = recent_values[-1]
-
-    return [
-        round(latest + slope * (step + 1), 2)
-        for step in range(steps)
-    ]
 
 
 def store_sensor_data(data):
@@ -280,32 +257,285 @@ def get_latest_sensor_data():
     return serialize_document(document)
 
 
+
+def predict_arima(values, steps, order=(1, 1, 1)):
+    """
+    Forecast future values using ARIMA.
+
+    values: list of historical sensor values
+    steps: number of future values to predict
+    order: ARIMA(p, d, q), default is (1, 1, 1)
+    """
+
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+    # ARIMA needs enough data to fit reliably.
+    # If too few values are available, use a simple fallback.
+    if len(values) < 8:
+        latest = values[-1]
+        return [round(latest, 2) for _ in range(steps)]
+
+    try:
+        model = ARIMA(values, order=order)
+        fitted_model = model.fit()
+
+        forecast = fitted_model.forecast(steps=steps)
+
+        return [round(float(value), 2) for value in forecast]
+
+    except Exception as e:
+        print(f"ARIMA prediction failed: {e}")
+
+        # Safe fallback: repeat latest value
+        latest = values[-1]
+        return [round(latest, 2) for _ in range(steps)]
+
+def predict_prophet(values, steps):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+ 
+
+    # Prophet requires columns named ds and y
+    df = pd.DataFrame({
+        "ds": pd.date_range(start="2024-01-01", periods=len(values), freq="D"),
+        "y": values
+    })
+
+    model = Prophet(
+        daily_seasonality=False,
+        weekly_seasonality=False,
+        yearly_seasonality=False
+    )
+
+    model.fit(df)
+
+    future = model.make_future_dataframe(periods=steps, freq="D")
+    forecast = model.predict(future)
+
+    predictions = forecast["yhat"].tail(steps)
+
+    return [
+        round(value, 2)
+        for value in predictions
+    ]
+
+def predict_least_squares(values, steps):
+
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) == 1:
+        return [round(values[0], 2) for _ in range(steps)]
+
+    recent_values = values[-8:]
+    mean_x = (len(recent_values) - 1) / 2
+    mean_y = sum(recent_values) / len(recent_values)
+    
+    numerator = sum(
+        (index - mean_x) * (value - mean_y)
+        for index, value in enumerate(recent_values)
+    )
+    
+    denominator = sum(
+        (index - mean_x) ** 2
+        for index, _value in enumerate(recent_values)
+    )
+    
+    slope = numerator / denominator if denominator else 0
+    latest = recent_values[-1]
+
+    return [
+        round(latest + slope * (step + 1), 2)
+        for step in range(steps)
+    ]
+
+
+def mean_value(values):
+    return sum(values) / len(values) if values else 0
+
+
+def sum_squared_error(values):
+    if not values:
+        return 0
+
+    mean = mean_value(values)
+    return sum((value - mean) ** 2 for value in values)
+
+
+def build_regression_tree(samples, depth=0, max_depth=3, min_leaf_size=2):
+    values = [sample[1] for sample in samples]
+
+    if depth >= max_depth or len(samples) <= min_leaf_size * 2:
+        return {"value": mean_value(values)}
+
+    samples = sorted(samples, key=lambda sample: sample[0])
+    best_index = None
+    best_loss = None
+
+    for index in range(min_leaf_size, len(samples) - min_leaf_size + 1):
+        left_samples = samples[:index]
+        right_samples = samples[index:]
+
+        if left_samples[-1][0] == right_samples[0][0]:
+            continue
+
+        loss = (
+            sum_squared_error([sample[1] for sample in left_samples])
+            + sum_squared_error([sample[1] for sample in right_samples])
+        )
+
+        if best_loss is None or loss < best_loss:
+            best_index = index
+            best_loss = loss
+
+    if best_index is None:
+        return {"value": mean_value(values)}
+
+    threshold = (samples[best_index - 1][0] + samples[best_index][0]) / 2
+    left_samples = [sample for sample in samples if sample[0] <= threshold]
+    right_samples = [sample for sample in samples if sample[0] > threshold]
+
+    if not left_samples or not right_samples:
+        return {"value": mean_value(values)}
+
+    return {
+        "threshold": threshold,
+        "left": build_regression_tree(
+            left_samples,
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf_size=min_leaf_size,
+        ),
+        "right": build_regression_tree(
+            right_samples,
+            depth=depth + 1,
+            max_depth=max_depth,
+            min_leaf_size=min_leaf_size,
+        ),
+    }
+
+
+def predict_regression_tree(tree, index):
+    if "value" in tree:
+        return tree["value"]
+
+    if index <= tree["threshold"]:
+        return predict_regression_tree(tree["left"], index)
+
+    return predict_regression_tree(tree["right"], index)
+
+
+def predict_decision_tree(values, steps):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) < 4:
+        return predict_least_squares(values, steps)
+
+    samples = [(index, float(value)) for index, value in enumerate(values)]
+    tree = build_regression_tree(samples)
+
+    return [
+        round(float(predict_regression_tree(tree, len(values) + step)), 2)
+        for step in range(steps)
+    ]
+
+
+def predict_random_forest(values, steps, tree_count=25):
+    if steps <= 0 or not values:
+        return []
+
+    if len(values) < 4:
+        return predict_least_squares(values, steps)
+
+    samples = [(index, float(value)) for index, value in enumerate(values)]
+    min_leaf_size = max(1, min(4, len(samples) // 6))
+    random_source = random.Random(len(values) * 1009 + steps)
+    forecasts = []
+
+    for tree_index in range(tree_count):
+        bootstrap_samples = [
+            random_source.choice(samples)
+            for _sample in samples
+        ]
+        tree = build_regression_tree(
+            bootstrap_samples,
+            max_depth=2 + (tree_index % 3),
+            min_leaf_size=min_leaf_size,
+        )
+        forecasts.append([
+            predict_regression_tree(tree, len(values) + step)
+            for step in range(steps)
+        ])
+
+    return [
+        round(sum(forecast[step] for forecast in forecasts) / len(forecasts), 2)
+        for step in range(steps)
+    ]
+
+
+def normalize_prediction_algorithm(algorithm):
+    normalized = algorithm.strip().lower().replace("_", " ").replace("-", " ")
+
+    aliases = {
+        "least square": "least_square",
+        "least squares": "least_square",
+        "linear least squares": "least_square",
+        "linear least square": "least_square",
+        "arima": "arima",
+        "prophet": "prophet",
+        "decision tree": "decision_tree",
+        "random forest": "random_forest",
+    }
+
+    return aliases.get(normalized, "least_square")
+
+
+def predict_values(values, steps, algorithm):
+    if algorithm == "arima":
+        return predict_arima(values, steps)
+
+    if algorithm == "prophet":
+        return predict_prophet(values, steps)
+
+    if algorithm == "decision_tree":
+        return predict_decision_tree(values, steps)
+
+    if algorithm == "random_forest":
+        return predict_random_forest(values, steps)
+
+    return predict_least_squares(values, steps)
+
+
 @app.get("/api/predictions")
-def get_predictions(steps: int = 10, limit: int = 28):
+def get_predictions(steps: int = 10, limit: int = 28, algorithm: str = "least square"):
     steps = max(0, min(steps, 100))
     limit = max(2, min(limit, 500))
+    prediction_algorithm = normalize_prediction_algorithm(algorithm)
     documents = list(newest_documents(limit))
     documents.reverse()
 
-    response = {
-        "steps": steps,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "predictions": {},
-    }
-
-    result = {}
+    metric_values = {key: [] for key in METRIC_FIELD_NAMES}
 
     for doc in documents:
         for key, field_name in METRIC_FIELD_NAMES.items():
-            val = doc.get(field_name)
-            if isinstance(val, (int, float)) and not isinstance(val, bool):
-                if key not in result:
-                    result[key] = []
-                result[key].append(val)
+            value = read_numeric_field(doc, [field_name])
 
-    for key, values in result.items():
-        if values:
-            response["predictions"][key] = predict_next_values(values, steps)
+            if value is not None:
+                metric_values[key].append(value)
+
+    response = {
+        key: predict_values(values, steps, prediction_algorithm)
+        for key, values in metric_values.items()
+    }
 
     return response
 
